@@ -1,3 +1,5 @@
+![EdgeFlowDiagramSVG](https://github.com/StefVuck/test/blob/main/diagram.svg)
+
 ## General Graph Legend
 ```mermaid
 flowchart LR
