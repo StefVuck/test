@@ -2,14 +2,21 @@
 -- Central map display with multi-zoom and redstone zoom control.
 --
 -- Map files expected (widest -> closest):
---   map_overworld_z1.lua, map_overworld_z2.lua, map_overworld_z3.lua
---   map_nether_z*.lua  (optional)
+--   map_overworld_z1.lua  (1:20 - widest overview)
+--   map_overworld_z2.lua  (1:10)
+--   map_overworld_z3.lua  (1:5)
+--   map_overworld_z4.lua  (1:3)
+--   map_overworld_z5.lua  (1:2)
+--   map_overworld_z6.lua  (1:1  - 1 block per pixel)
+--   map_nether_z*.lua     (optional, same structure)
 --
 -- Controls:
 --   Monitor touch  - cycle zoom level
 --   Redstone       - any side, analog 0-15 selects zoom (0=widest, 15=closest)
 --   R key          - reload all map files from disk
 --   D key          - toggle dimension
+--
+-- Scale indicator: top-right corner shows "1:S" (blocks per pixel) after each render.
 
 local CHANNEL       = "train_map"
 local REDRAW_PERIOD = 0.25
@@ -44,8 +51,22 @@ local function loadMap(path)
 end
 
 local MAP_FILES = {
-  overworld = { "map_overworld_z1.lua", "map_overworld_z2.lua", "map_overworld_z3.lua" },
-  nether    = { "map_nether_z1.lua",    "map_nether_z2.lua",    "map_nether_z3.lua"    },
+  overworld = {
+    "map_overworld_z1.lua",   -- 1:20  widest overview
+    "map_overworld_z2.lua",   -- 1:10
+    "map_overworld_z3.lua",   -- 1:5
+    "map_overworld_z4.lua",   -- 1:3
+    "map_overworld_z5.lua",   -- 1:2
+    "map_overworld_z6.lua",   -- 1:1  one block per pixel
+  },
+  nether = {
+    "map_nether_z1.lua",
+    "map_nether_z2.lua",
+    "map_nether_z3.lua",
+    "map_nether_z4.lua",
+    "map_nether_z5.lua",
+    "map_nether_z6.lua",
+  },
 }
 local allMaps = { overworld = {}, nether = {} }
 
@@ -141,6 +162,27 @@ local function render()
     mon.setCursorPos(1, cy)
     mon.blit(table.concat(chars), table.concat(fgs), table.concat(bgs))
   end
+end
+
+-- ---------------------------------------------------------------------------
+-- Scale indicator  ("1:S" in top-right corner, using reserved palette slots)
+--
+-- With --colours 14, map pixel values only use indices 0-13, so:
+--   colors.black (HEX_TO_SLOT[14]) - never written by applyPalette, safe to repurpose
+--   TRAIN_COLOUR (colors.red)      - set to 0xff0040 by applyPalette, use for text fg
+
+local function renderScaleIndicator()
+  local map = currentMap()
+  if not map then return end
+  local s = math.floor((map.bbox.maxX - map.bbox.minX) / map.width + 0.5)
+  local label = "1:" .. tostring(s)
+  local len   = #label
+  -- Dark background: set colors.black to near-black (never touched by applyPalette)
+  mon.setPaletteColour(colors.black, 0x111111)
+  local fg = colors.toBlit(TRAIN_COLOUR)   -- bright red/pink  (already 0xff0040)
+  local bg = colors.toBlit(colors.black)   -- dark
+  mon.setCursorPos(CW - len + 1, 1)
+  mon.blit(label, fg:rep(len), bg:rep(len))
 end
 
 -- ---------------------------------------------------------------------------
@@ -269,6 +311,7 @@ local function renderLoop()
   while true do
     recomputeTrainPositions()
     render()
+    renderScaleIndicator()
     sleep(REDRAW_PERIOD)
   end
 end
