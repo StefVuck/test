@@ -1,17 +1,19 @@
 -- display.lua
--- Runs on a CC computer wired to a 3x3 advanced monitor and an ender/wired modem.
--- Loads pre-baked map_overworld.lua and map_nether.lua, listens to station events,
--- maintains train state, and renders.
+-- Central map display with multi-zoom and redstone zoom control.
 --
--- Rendering uses the half-block trick: each character cell renders TWO vertical
--- pixels via the '\127' / '\143' characters (▀ effectively) by setting bg and fg
--- to the two pixel colours. Effective resolution = monitor_chars_w x (monitor_chars_h * 2).
+-- Map files expected (widest -> closest):
+--   map_overworld_z1.lua, map_overworld_z2.lua, map_overworld_z3.lua
+--   map_nether_z*.lua  (optional)
 --
--- For a 3x3 advanced monitor at scale 0.5: 164 x 81.
+-- Controls:
+--   Monitor touch  - cycle zoom level
+--   Redstone       - any side, analog 0-15 selects zoom (0=widest, 15=closest)
+--   R key          - reload all map files from disk
+--   D key          - toggle dimension
 
 local CHANNEL       = "train_map"
 local REDRAW_PERIOD = 0.25
-local TRAIN_TIMEOUT = 600         -- drop trains we haven't heard about in N seconds
+local TRAIN_TIMEOUT = 600
 
 -- ---------------------------------------------------------------------------
 -- Peripherals
@@ -29,8 +31,8 @@ rednet.open(modemSide)
 
 mon.setTextScale(0.5)
 local CW, CH = mon.getSize()
-local PW, PH = CW, CH * 2     -- pixel-space dimensions with half-block trick
-print(("Monitor: %d x %d chars  ->  map should be %d x %d px"):format(CW, CH, PW, PH))
+local PW, PH = CW, CH * 2
+print(("Monitor: %d x %d chars -> map %d x %d px"):format(CW, CH, PW, PH))
 
 -- ---------------------------------------------------------------------------
 -- Map loading
@@ -38,40 +40,60 @@ print(("Monitor: %d x %d chars  ->  map should be %d x %d px"):format(CW, CH, PW
 local function loadMap(path)
   if not fs.exists(path) then return nil end
   local fn = loadfile(path)
-  if not fn then return nil end
-  return fn()
+  return fn and fn() or nil
 end
 
-local maps = {
-  overworld = loadMap("map_overworld.lua"),
-  nether    = loadMap("map_nether.lua"),
+local MAP_FILES = {
+  overworld = { "map_overworld_z1.lua", "map_overworld_z2.lua", "map_overworld_z3.lua" },
+  nether    = { "map_nether_z1.lua",    "map_nether_z2.lua",    "map_nether_z3.lua"    },
 }
-assert(maps.overworld or maps.nether, "no maps loaded")
+local allMaps = { overworld = {}, nether = {} }
 
-local currentDim = maps.overworld and "overworld" or "nether"
+local function loadAllMaps()
+  for dim, files in pairs(MAP_FILES) do
+    allMaps[dim] = {}
+    for _, f in ipairs(files) do
+      local m = loadMap(f)
+      if m then allMaps[dim][#allMaps[dim] + 1] = m end
+    end
+  end
+  print(("Loaded: %d overworld, %d nether zoom levels"):format(
+    #allMaps.overworld, #allMaps.nether))
+end
+
+loadAllMaps()
+assert(#allMaps.overworld > 0 or #allMaps.nether > 0, "no maps loaded")
+
+local currentDim = (#allMaps.overworld > 0) and "overworld" or "nether"
+local zoomLevel  = 1   -- 1 = widest, N = closest
+
+local function currentMap()
+  local list = allMaps[currentDim]
+  if not list or #list == 0 then return nil end
+  return list[math.min(zoomLevel, #list)]
+end
 
 -- ---------------------------------------------------------------------------
--- Palette setup: apply per-dimension palette to monitor colour slots
+-- Palette
+-- Only 15 CC colour slots are used for map data so that colors.red is never
+-- overwritten by applyPalette and remains exclusively for train markers.
 
 local PALETTE_SLOTS = {
   colors.white, colors.orange, colors.magenta, colors.lightBlue,
-  colors.yellow, colors.lime, colors.pink, colors.gray,
+  colors.yellow, colors.lime,  colors.pink,    colors.gray,
   colors.lightGray, colors.cyan, colors.purple, colors.blue,
-  colors.brown, colors.green, colors.red, colors.black,
+  colors.brown, colors.green, colors.black,
 }
 local HEX_TO_SLOT = {}
 for i, slot in ipairs(PALETTE_SLOTS) do HEX_TO_SLOT[i - 1] = slot end
--- Reserve one slot for train markers; we overwrite slot 15 (black) at render time
--- if needed, but the half-block trick means we just need *colours.red* available
--- with a high-contrast value.
+
 local TRAIN_COLOUR = colors.red
 
 local function applyPalette(map)
-  for idx = 0, 15 do
+  for idx = 0, #PALETTE_SLOTS - 1 do
     local hex = map.palette[idx]
     if hex then mon.setPaletteColour(HEX_TO_SLOT[idx], hex) end
   end
-  -- Force the train marker slot to bright red regardless of map palette
   mon.setPaletteColour(TRAIN_COLOUR, 0xff0040)
 end
 
@@ -82,13 +104,11 @@ local hexVal = {}
 for i = 0, 15 do hexVal[string.format("%x", i)] = i end
 
 local function pixelAt(map, x, y)
-  -- x in [0, PW), y in [0, PH)
-  if x < 0 or x >= map.width or y < 0 or y >= map.height then return 15 end
+  if x < 0 or x >= map.width or y < 0 or y >= map.height then return 0 end
   local idx = y * map.width + x + 1
-  return hexVal[map.pixels:sub(idx, idx)] or 15
+  return hexVal[map.pixels:sub(idx, idx)] or 0
 end
 
--- Train overlay: list of {dim=, px=, py=, name=}
 local trainPixels = {}
 
 local function isTrainAt(px, py)
@@ -97,34 +117,26 @@ local function isTrainAt(px, py)
   end
 end
 
--- Half-block character: U+2580 ▀ — top half foreground, bottom half background.
--- CC uses the legacy "\143" for the top-half block in its bundled font.
 local HALF = "\143"
 
 local function render()
-  local map = maps[currentDim]
+  local map = currentMap()
   if not map then return end
   applyPalette(map)
 
-  -- Build per-row strings: each char cell = 2 vertical pixels.
   for cy = 1, CH do
     local pyTop = (cy - 1) * 2
     local pyBot = pyTop + 1
     local chars, fgs, bgs = {}, {}, {}
     for cx = 1, CW do
-      local px = cx - 1
-      local topIdx = pixelAt(map, px, pyTop)
-      local botIdx = pixelAt(map, px, pyBot)
-
-      -- Train markers override the underlying pixel
-      local topIsTrain = isTrainAt(px, pyTop) ~= nil
-      local botIsTrain = isTrainAt(px, pyBot) ~= nil
-
-      local fgCol = topIsTrain and TRAIN_COLOUR or HEX_TO_SLOT[topIdx]
-      local bgCol = botIsTrain and TRAIN_COLOUR or HEX_TO_SLOT[botIdx]
+      local px   = cx - 1
+      local tIdx = pixelAt(map, px, pyTop)
+      local bIdx = pixelAt(map, px, pyBot)
+      local topTr = isTrainAt(px, pyTop) ~= nil
+      local botTr = isTrainAt(px, pyBot) ~= nil
       chars[cx] = HALF
-      fgs[cx]   = colors.toBlit(fgCol)
-      bgs[cx]   = colors.toBlit(bgCol)
+      fgs[cx]   = colors.toBlit(topTr and TRAIN_COLOUR or HEX_TO_SLOT[tIdx])
+      bgs[cx]   = colors.toBlit(botTr and TRAIN_COLOUR or HEX_TO_SLOT[bIdx])
     end
     mon.setCursorPos(1, cy)
     mon.blit(table.concat(chars), table.concat(fgs), table.concat(bgs))
@@ -134,17 +146,9 @@ end
 -- ---------------------------------------------------------------------------
 -- Station registry & train state
 
--- stations[id] = { dimension, coords={x,z}, name }
 local stations = {}
-
--- trains[name] = {
---   dim, lastStation, departedAt, nextStation, edgeETA,
---   currentPx, currentPy,
--- }
-local trains = {}
-
--- edges[fromId..">"..toId] = { dim, knownSeconds }
-local edges = {}
+local trains   = {}
+local edges    = {}
 
 local function worldToPixel(map, wx, wz)
   local fx = (wx - map.bbox.minX) / (map.bbox.maxX - map.bbox.minX)
@@ -157,32 +161,25 @@ local function lerp(a, b, t) return a + (b - a) * t end
 local function recomputeTrainPositions()
   trainPixels = {}
   local now = os.epoch("utc") / 1000
-
   for name, t in pairs(trains) do
-    -- Drop stale trains
     if t.lastSeen and (now - t.lastSeen) > TRAIN_TIMEOUT then
       trains[name] = nil
     else
-      local map = maps[t.dim]
-      if map and t.lastStation then
+      local map = currentMap()
+      if map and t.dim == currentDim and t.lastStation then
         local from = stations[t.lastStation]
-        if t.atStation then
-          if from then
-            local px, py = worldToPixel(map, from.coords.x, from.coords.z)
-            trainPixels[#trainPixels + 1] = { dim = t.dim, px = px, py = py, name = name }
-          end
-        elseif t.nextStation and stations[t.nextStation] then
-          local to = stations[t.nextStation]
+        if t.atStation and from then
+          local px, py = worldToPixel(map, from.coords.x, from.coords.z)
+          trainPixels[#trainPixels + 1] = { dim = t.dim, px = px, py = py, name = name }
+        elseif t.nextStation and stations[t.nextStation] and from then
+          local to  = stations[t.nextStation]
           local key = t.lastStation .. ">" .. t.nextStation
           local eta = edges[key] and edges[key].knownSeconds or 60
-          local elapsed = now - (t.departedAt or now)
-          local progress = math.min(1, elapsed / eta)
-          if from and to then
-            local wx = lerp(from.coords.x, to.coords.x, progress)
-            local wz = lerp(from.coords.z, to.coords.z, progress)
-            local px, py = worldToPixel(map, wx, wz)
-            trainPixels[#trainPixels + 1] = { dim = t.dim, px = px, py = py, name = name }
-          end
+          local progress = math.min(1, (now - (t.departedAt or now)) / eta)
+          local px, py = worldToPixel(map,
+            lerp(from.coords.x, to.coords.x, progress),
+            lerp(from.coords.z, to.coords.z, progress))
+          trainPixels[#trainPixels + 1] = { dim = t.dim, px = px, py = py, name = name }
         elseif from then
           local px, py = worldToPixel(map, from.coords.x, from.coords.z)
           trainPixels[#trainPixels + 1] = { dim = t.dim, px = px, py = py, name = name }
@@ -190,13 +187,6 @@ local function recomputeTrainPositions()
       end
     end
   end
-end
-
-local function nextStationFromSchedule(train)
-  -- Best-effort: pull first DESTINATION entry from getSchedule output.
-  -- Schedule format is a Create-specific table; we don't always have one,
-  -- and parsing it is left for live testing. Return nil for now.
-  return nil
 end
 
 local function handleEvent(msg)
@@ -216,48 +206,60 @@ local function handleEvent(msg)
 
   if msg.event == "arrived" and trainName then
     local t = trains[trainName] or { dim = msg.dimension }
-    -- If we knew this train was travelling lastStation -> sid, record edge time
     if t.lastStation and t.departedAt and t.nextStation == sid then
-      local key = t.lastStation .. ">" .. sid
-      edges[key] = { dim = msg.dimension, knownSeconds = now - t.departedAt }
+      edges[t.lastStation .. ">" .. sid] = {
+        dim = msg.dimension, knownSeconds = now - t.departedAt
+      }
     end
-    t.dim = msg.dimension
-    t.lastStation = sid
-    t.atStation = true
-    t.departedAt = nil
-    t.nextStation = nil
-    t.lastSeen = now
-    trains[trainName] = t
+    t.dim = msg.dimension; t.lastStation = sid
+    t.atStation = true;  t.departedAt = nil; t.nextStation = nil
+    t.lastSeen  = now;   trains[trainName] = t
 
   elseif msg.event == "departed" and trainName then
     local t = trains[trainName] or { dim = msg.dimension }
-    t.dim = msg.dimension
-    t.lastStation = t.lastStation or sid
-    t.atStation = false
-    t.departedAt = now
-    t.lastSeen = now
-    -- We don't know nextStation reliably without parsing schedule; left nil
+    t.dim = msg.dimension; t.lastStation = t.lastStation or sid
+    t.atStation = false; t.departedAt = now; t.lastSeen = now
     trains[trainName] = t
   end
 end
 
 -- ---------------------------------------------------------------------------
--- Input: monitor_touch toggles dimension
+-- Zoom from redstone: check all sides, use the highest analog signal
+
+local function zoomFromRedstone()
+  local s = 0
+  for _, side in ipairs({ "top", "bottom", "left", "right", "front", "back" }) do
+    s = math.max(s, rs.getAnalogInput(side))
+  end
+  local n = math.max(1, #allMaps[currentDim])
+  -- Map 0-15 evenly onto zoom levels 1..n
+  return math.min(n, math.floor(s * n / 16) + 1)
+end
+
+-- ---------------------------------------------------------------------------
+-- Input & render loops
 
 local function inputLoop()
   while true do
-    local ev, side, x, y = os.pullEvent()
+    local ev, a, b, c = os.pullEvent()
+
     if ev == "monitor_touch" then
-      currentDim = (currentDim == "overworld") and "nether" or "overworld"
-      if not maps[currentDim] then
-        currentDim = (currentDim == "overworld") and "nether" or "overworld"
+      local n = #allMaps[currentDim]
+      if n > 0 then zoomLevel = (zoomLevel % n) + 1 end
+
+    elseif ev == "redstone" then
+      zoomLevel = zoomFromRedstone()
+
+    elseif ev == "key" then
+      if a == keys.r then
+        loadAllMaps()
+      elseif a == keys.d then
+        local other = (currentDim == "overworld") and "nether" or "overworld"
+        if #allMaps[other] > 0 then currentDim = other end
       end
-    elseif ev == "key" and side == keys.r then
-      maps.overworld = loadMap("map_overworld.lua")
-      maps.nether    = loadMap("map_nether.lua")
-      print("Maps reloaded")
+
     elseif ev == "rednet_message" then
-      local _, msg, proto = side, x, y
+      local _, msg, proto = a, b, c
       if proto == CHANNEL then handleEvent(msg) end
     end
   end
